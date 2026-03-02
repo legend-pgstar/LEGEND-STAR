@@ -1,0 +1,7 @@
+﻿discord.py
+python-dotenv
+pymongo
+aiohttp
+pytz
+croniter
+aiosqlite

@@ -1,0 +1,9 @@
+# railway.template.toml
+# Copy to `railway.toml` after running `railway init` and filling values.
+
+[project]
+# id = "your-project-id"
+
+[services.web]
+run = "python main.py"
+dockerfilePath = "Dockerfile"
