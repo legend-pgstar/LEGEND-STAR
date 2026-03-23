@@ -43,6 +43,7 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 CLIENT_ID = os.getenv("CLIENT_ID")
 GUILD_ID_STR = os.getenv("GUILD_ID", "0")
 MONGODB_URI = os.getenv("MONGODB_URI")
+FRONTEND_URL = os.getenv("FRONTEND_URL", "https://legend-pgstar.github.io/LEGEND-STAR")
 OWNER_ID = 1406313503278764174
 
 # Validate required environment variables
@@ -3636,6 +3637,29 @@ async def manual_sync(ctx):
         await ctx.send(f"Sync failed: {e}")
 
 # ==================== LOCKDOWN CONTROL ====================
+@tree.command(name="control", description="Open Legend Star Control Panel", guild=GUILD)
+async def control(interaction: discord.Interaction):
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message(
+            "❌ You are not authorized to use this command.",
+            ephemeral=True,
+        )
+        return
+
+    dashboard_url = f"{FRONTEND_URL}/control"
+    view = discord.ui.View()
+    view.add_item(discord.ui.Button(
+        label="Open Control Panel",
+        url=dashboard_url,
+        style=discord.ButtonStyle.link,
+    ))
+
+    await interaction.response.send_message(
+        "🚀 Open your Legend Star Control Panel:",
+        view=view,
+        ephemeral=True,
+    )
+
 @tree.command(name="ok", description="Owner only: Unlock server from lockdown", guild=GUILD)
 @checks.has_role(ROLE_ID)
 async def ok_command(interaction: discord.Interaction):
@@ -3780,6 +3804,8 @@ async def handle(_):
 
 app = web.Application()
 app.router.add_get('/', handle)
+# Serve static files from legend-star directory
+app.router.add_static('/LEGEND-STAR', 'legend-star', name='legend-star')
 
 async def main():
     runner = web.AppRunner(app)
