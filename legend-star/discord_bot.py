@@ -10,6 +10,8 @@ from discord.ext import commands
 load_dotenv()
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
 API_KEY = os.getenv("API_KEY")
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+FRONTEND_URL = os.getenv("FRONTEND_URL", "https://legend-pgstar.github.io/LEGEND-STAR")
 
 HEADERS = {"x-api-key": API_KEY, "Content-Type": "application/json"}
 
@@ -90,12 +92,46 @@ async def execute_control_loop():
 
 @bot.event
 async def on_ready():
+    await bot.tree.sync()
     print(f"Logged in as {bot.user}")
     await post_log({
         "type": "system",
         "content": "Bot started",
         "time": now_iso(),
     })
+
+
+@bot.tree.command(name="control", description="Open Legend Star Control Panel")
+async def control(interaction: discord.Interaction):
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message(
+            "❌ You are not authorized to use this command.",
+            ephemeral=True,
+        )
+        return
+
+    dashboard_url = f"{FRONTEND_URL}/control"
+    view = discord.ui.View()
+    view.add_item(discord.ui.Button(
+        label="Open Control Panel",
+        url=dashboard_url,
+        style=discord.ButtonStyle.link,
+    ))
+
+    await post_log({
+        "type": "system",
+        "event": "control_panel_opened",
+        "user": str(interaction.user),
+        "user_id": interaction.user.id,
+        "content": "Control panel link requested",
+        "time": now_iso(),
+    })
+
+    await interaction.response.send_message(
+        "🚀 Open your Legend Star Control Panel:",
+        view=view,
+        ephemeral=True,
+    )
 
 
 @bot.command(name="send")
