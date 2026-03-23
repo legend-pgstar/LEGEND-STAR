@@ -43,7 +43,8 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 CLIENT_ID = os.getenv("CLIENT_ID")
 GUILD_ID_STR = os.getenv("GUILD_ID", "0")
 MONGODB_URI = os.getenv("MONGODB_URI")
-FRONTEND_URL = os.getenv("FRONTEND_URL", "https://legend-pgstar.github.io/LEGEND-STAR")
+PORT = int(os.getenv("PORT", 3000))
+FRONTEND_URL = os.getenv("FRONTEND_URL", f"http://localhost:{PORT}/LEGEND-STAR")
 OWNER_ID = 1406313503278764174
 
 # Validate required environment variables
@@ -65,7 +66,6 @@ AUTO_LB_CHANNEL_ID = 1455385042044846242
 AUTO_LB_PING_ROLE_ID = 1457931098171506719  # 🏆 Role to ping at 11:55 for leaderboard announcement
 TODO_CHANNEL_ID = 1458400694682783775
 ROLE_ID = 1458400797133115474
-PORT = int(os.getenv("PORT", 3000))
 print(f"GUILD_ID from env: {GUILD_ID}")  # DEBUG: Check if set correctly
 # Excluded voice channel ID: do not record cam on/off minutes for this VC
 EXCLUDED_VOICE_CHANNEL_ID = 1466076240111992954
@@ -3798,14 +3798,21 @@ async def on_ready():
     except Exception as e:
         print(f"⚠️ Startup sweep error: {e}")
 
-# Keep-alive
+# Keep-alive and frontend hosting
 async def handle(_):
-    return web.Response(text="LegendBot Online! 🦚")
+    return web.FileResponse('legend-star/index.html')
+
+async def spa_fallback(request):
+    return web.FileResponse('legend-star/index.html')
 
 app = web.Application()
 app.router.add_get('/', handle)
-# Serve static files from legend-star directory
+app.router.add_get('/control', spa_fallback)
+app.router.add_get('/LEGEND-STAR', spa_fallback)
+
+# Serve SPA static files
 app.router.add_static('/LEGEND-STAR', 'legend-star', name='legend-star')
+app.router.add_static('/assets', 'legend-star/assets', name='assets')
 
 async def main():
     runner = web.AppRunner(app)
