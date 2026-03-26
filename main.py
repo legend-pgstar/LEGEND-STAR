@@ -1116,27 +1116,41 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
     elif before.channel:
         print(f"🔍 VC LEAVE: {member.name} ({member.id}) ← {before.channel.name} (ID: {before.channel.id})")
 
-    # CREATE temp voice channel when user joins lobby
+    # CREATE or MOVE to temp voice channel when user joins lobby
     if after.channel and after.channel.id == LOBBY_CHANNEL_ID:
-        print(f"✅ DETECTED: {member.name} joined LOBBY! Creating temp channel...")
+        print(f"✅ DETECTED: {member.name} joined LOBBY! Creating or moving to temp channel...")
         try:
-            # Prevent duplicates for same owner
+            # Check for existing temp channel (DB or runtime)
             existing = None
+            channel_obj = None
             print(f"  [CHECK] Scanning for existing channel owned by {member.name} (ID: {member.id})...")
             if tempvoice_db_available and tempvoice_coll is not None:
                 existing = await tempvoice_db_find_one({"owner_id": member.id, "guild_id": member.guild.id})
                 if existing:
                     print(f"  ✅ Found existing DB entry: {existing}")
-                else:
-                    print(f"  ℹ️ No existing channel found in DB")
+                    channel_id = existing.get("channel_id")
+                    if channel_id:
+                        channel_obj = member.guild.get_channel(channel_id)
             else:
                 print(f"  ℹ️ MongoDB unavailable, checking runtime cache...")
-                existing = member.id in tempvoice_runtime_channel_by_owner
-                if existing:
-                    print(f"  ✅ Found existing channel in runtime cache")
+                channel_id = tempvoice_runtime_channel_by_owner.get(member.id)
+                if channel_id:
+                    channel_obj = member.guild.get_channel(channel_id)
+                    if channel_obj:
+                        print(f"  ✅ Found existing channel in runtime cache")
 
-            if existing:
-                print(f"⚠️ Temp channel already exists for {member.name} (owner_id={member.id})")
+            if channel_obj:
+                print(f"⚠️ Temp channel already exists for {member.name} (owner_id={member.id}), moving user...")
+                # Move user to their temp channel if not already there
+                if not member.voice or member.voice.channel.id != channel_obj.id:
+                    try:
+                        await asyncio.sleep(0.5)
+                        await member.move_to(channel_obj)
+                        print(f"    ✅ User moved to existing temp channel: {channel_obj.name} (ID: {channel_obj.id})")
+                    except Exception as e:
+                        print(f"    ⚠️ Failed to move user to existing temp channel: {e}")
+                else:
+                    print(f"    ℹ️ User already in their temp channel")
             else:
                 # 1️⃣ Fetch category
                 print(f"    [STEP 1] Fetching category {TEMP_CATEGORY_ID}...")
@@ -1144,7 +1158,7 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
                 if category and not isinstance(category, discord.CategoryChannel):
                     print(f"    ⚠️ Channel {TEMP_CATEGORY_ID} is not a CategoryChannel")
                     category = None
-                
+
                 if category:
                     print(f"    ✅ Category found: {category.name}")
                 else:
