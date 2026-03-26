@@ -484,12 +484,22 @@ def is_whitelisted_entity(actor_or_id):
 
 # ==================== TEMP VOICE OWNER CONTROLS HELPERS ====================
 
+tempvoice_runtime_owner_by_channel = {}  # channel_id -> owner_id
+tempvoice_runtime_channel_by_owner = {}  # owner_id -> channel_id
+
 async def is_temp_channel_owner(user_id: int, channel_id: int) -> bool:
     """Check whether user owns temp voice channel in DB"""
+    cached_owner = tempvoice_runtime_owner_by_channel.get(channel_id)
+    if cached_owner is not None:
+        return cached_owner == user_id
+
     if not tempvoice_coll:
         return False
     try:
         doc = await tempvoice_coll.find_one({"channel_id": channel_id})
+        if doc and doc.get("owner_id") is not None:
+            tempvoice_runtime_owner_by_channel[channel_id] = doc.get("owner_id")
+            tempvoice_runtime_channel_by_owner[doc.get("owner_id")] = channel_id
         return bool(doc and doc.get("owner_id") == user_id)
     except Exception as e:
         print(f"⚠️ is_temp_channel_owner DB error: {e}")
@@ -1334,155 +1344,328 @@ async def before_batch_save():
 
 # ==================== TEMP VOICE OWNER CONTROLS ====================
 
-async def get_owned_temp_channel(interaction: discord.Interaction):
+async def _tempvoice_safe_defer(interaction: discord.Interaction):
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True, thinking=True)
+    except Exception:
+        pass
+
+
+async def _tempvoice_send(interaction: discord.Interaction, message: str):
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+    except Exception as e:
+        print(f"⚠️ tempvoice interaction send failed: {e}")
+
+
+async def get_owned_temp_channel(interaction: discord.Interaction, *, require_user_in_channel: bool = False):
     """Returns owned temp voice channel instance or None."""
-    if interaction.user.voice and interaction.user.voice.channel:
-        channel = interaction.user.voice.channel
-        if channel and await is_temp_channel_owner(interaction.user.id, channel.id):
-            return channel
+    guild = interaction.guild
+    if not guild:
+        return None
+
+    voice_channel = interaction.user.voice.channel if interaction.user.voice else None
+    if voice_channel:
+        runtime_owner = tempvoice_runtime_owner_by_channel.get(voice_channel.id)
+        if runtime_owner == interaction.user.id:
+            return voice_channel
+        if await is_temp_channel_owner(interaction.user.id, voice_channel.id):
+            return voice_channel
+        if require_user_in_channel:
+            return None
+    elif require_user_in_channel:
+        return None
+
+    runtime_channel_id = tempvoice_runtime_channel_by_owner.get(interaction.user.id)
+    if runtime_channel_id:
+        runtime_channel = guild.get_channel(runtime_channel_id)
+        if runtime_channel:
+            return runtime_channel
+        tempvoice_runtime_channel_by_owner.pop(interaction.user.id, None)
 
     if not tempvoice_coll:
         return None
 
-    entry = await tempvoice_coll.find_one({"owner_id": interaction.user.id, "guild_id": interaction.guild.id})
-    if entry:
-        return interaction.guild.get_channel(entry.get("channel_id"))
+    try:
+        entry = await tempvoice_coll.find_one({"owner_id": interaction.user.id, "guild_id": guild.id})
+    except Exception as e:
+        print(f"⚠️ get_owned_temp_channel DB error: {e}")
+        return None
+
+    if not entry:
+        return None
+
+    channel_id = entry.get("channel_id")
+    channel = guild.get_channel(channel_id) if channel_id else None
+    if channel:
+        tempvoice_runtime_owner_by_channel[channel.id] = interaction.user.id
+        tempvoice_runtime_channel_by_owner[interaction.user.id] = channel.id
+        return channel
+
+    # Stale DB entry -> cleanup so user can recreate
+    try:
+        await tempvoice_coll.delete_many({"owner_id": interaction.user.id, "guild_id": guild.id})
+    except Exception as e:
+        print(f"⚠️ Failed to cleanup stale temp voice DB entry for {interaction.user.id}: {e}")
     return None
 
 async def check_temp_owner_and_channel(interaction: discord.Interaction):
-    channel = await get_owned_temp_channel(interaction)
+    channel = await get_owned_temp_channel(interaction, require_user_in_channel=True)
     if not channel:
-        await interaction.response.send_message("❌ You must be the owner of a temp voice channel and be in it to use this command.", ephemeral=True)
+        await _tempvoice_send(interaction, "❌ You must be the owner of a temp voice channel and be in it to use this command.")
         return None
     return channel
 
 @tree.command(name="create", description="Create your own temporary voice channel", guild=GUILD)
 async def create_temp_channel(interaction: discord.Interaction):
+    await _tempvoice_safe_defer(interaction)
+
     guild = interaction.guild
     if not guild:
-        return await interaction.response.send_message("❌ Guild context missing.", ephemeral=True)
+        return await _tempvoice_send(interaction, "❌ Guild context missing.")
+
+    # Runtime cached existing channel (fast path)
+    runtime_existing_id = tempvoice_runtime_channel_by_owner.get(interaction.user.id)
+    if runtime_existing_id:
+        runtime_existing_chan = guild.get_channel(runtime_existing_id)
+        if runtime_existing_chan:
+            return await _tempvoice_send(interaction, f"⚠️ You already have a temp channel: {runtime_existing_chan.mention}")
+        tempvoice_runtime_channel_by_owner.pop(interaction.user.id, None)
 
     existing = None
     if tempvoice_coll:
-        existing = await tempvoice_coll.find_one({"owner_id": interaction.user.id, "guild_id": guild.id})
+        try:
+            existing = await tempvoice_coll.find_one({"owner_id": interaction.user.id, "guild_id": guild.id})
+        except Exception as e:
+            print(f"⚠️ Temp voice DB check failed: {e}")
 
     if existing:
         existing_chan = guild.get_channel(existing.get("channel_id"))
         if existing_chan:
-            return await interaction.response.send_message(f"⚠️ You already have a temp channel: {existing_chan.mention}", ephemeral=True)
+            tempvoice_runtime_owner_by_channel[existing_chan.id] = interaction.user.id
+            tempvoice_runtime_channel_by_owner[interaction.user.id] = existing_chan.id
+            return await _tempvoice_send(interaction, f"⚠️ You already have a temp channel: {existing_chan.mention}")
+        if tempvoice_coll:
+            try:
+                await tempvoice_coll.delete_many({"owner_id": interaction.user.id, "guild_id": guild.id})
+            except Exception as e:
+                print(f"⚠️ Temp voice stale entry cleanup failed: {e}")
 
     category = guild.get_channel(TEMP_VOICE_CATEGORY_ID) if TEMP_VOICE_CATEGORY_ID else None
-    channel_name = f"{interaction.user.name}'s Room"
+    if category and not isinstance(category, discord.CategoryChannel):
+        category = None
+
+    channel_name = f"{interaction.user.name}'s Room"[:100]
 
     try:
-        channel = await guild.create_voice_channel(name=channel_name, category=category, reason="Temp voice channel create command")
-        if tempvoice_coll:
-            await tempvoice_coll.insert_one({"channel_id": channel.id, "owner_id": interaction.user.id, "guild_id": guild.id})
-
-        await channel.set_permissions(interaction.guild.default_role, connect=True)
-        await channel.set_permissions(interaction.user, manage_channels=True, connect=True, speak=True)
-
-        if interaction.user.voice and interaction.user.voice.channel:
-            await interaction.user.move_to(channel)
-
-        await interaction.response.send_message(f"✅ Created temp voice channel: {channel.mention}", ephemeral=True)
+        channel = await guild.create_voice_channel(
+            name=channel_name,
+            category=category,
+            reason="Temp voice channel create command",
+        )
     except Exception as e:
         print(f"⚠️ create_temp_channel failed: {e}")
-        await interaction.response.send_message(f"❌ Failed to create temp channel: {e}", ephemeral=True)
+        if isinstance(e, discord.Forbidden):
+            return await _tempvoice_send(
+                interaction,
+                "❌ I don't have permission to create voice channels here. "
+                "Grant the bot `Manage Channels` (and set `TEMP_VOICE_CATEGORY_ID` in `.env` if you want channels created inside a specific category).",
+            )
+        return await _tempvoice_send(interaction, f"❌ Failed to create temp channel: {str(e)[:180]}")
+
+    # Cache ownership in runtime (DB write may fail but commands should still work)
+    tempvoice_runtime_owner_by_channel[channel.id] = interaction.user.id
+    tempvoice_runtime_channel_by_owner[interaction.user.id] = channel.id
+
+    if tempvoice_coll:
+        try:
+            await tempvoice_coll.delete_many({"owner_id": interaction.user.id, "guild_id": guild.id})
+            await tempvoice_coll.insert_one({"channel_id": channel.id, "owner_id": interaction.user.id, "guild_id": guild.id})
+        except Exception as e:
+            print(f"⚠️ Temp voice DB save failed (non-fatal): {e}")
+
+    # Try to set basic perms (non-fatal if missing perms)
+    perms_ok = True
+    try:
+        await channel.set_permissions(guild.default_role, connect=True, view_channel=True)
+        await channel.set_permissions(interaction.user, manage_channels=True, connect=True, speak=True, view_channel=True)
+    except Exception as e:
+        perms_ok = False
+        print(f"⚠️ Temp voice permission set failed (non-fatal): {e}")
+
+    moved = False
+    move_error = None
+    if interaction.user.voice and interaction.user.voice.channel:
+        try:
+            await interaction.user.move_to(channel)
+            moved = True
+        except Exception as e:
+            move_error = e
+            print(f"⚠️ Temp voice move failed (non-fatal): {e}")
+
+    if moved:
+        return await _tempvoice_send(interaction, f"✅ Created and moved you to: {channel.mention}")
+
+    msg = f"✅ Created temp voice channel: {channel.mention}"
+    if move_error is not None:
+        msg += " (I couldn't move you — missing `Move Members` permission?)"
+    if not perms_ok:
+        msg += " (I couldn't set permissions — check `Manage Channels` permission.)"
+    return await _tempvoice_send(interaction, msg)
 
 @tree.command(name="delete", description="Delete your temp voice channel", guild=GUILD)
 async def delete_temp_channel(interaction: discord.Interaction):
+    await _tempvoice_safe_defer(interaction)
+
     channel = await get_owned_temp_channel(interaction)
     if not channel:
-        return
+        return await _tempvoice_send(interaction, "❌ You don't have an active temp voice channel.")
 
     try:
         await channel.delete(reason="Owner deleted temp voice channel")
-        if tempvoice_coll:
-            await tempvoice_coll.delete_one({"channel_id": channel.id})
-        await interaction.response.send_message("🗑️ Temp channel deleted", ephemeral=True)
     except Exception as e:
         print(f"⚠️ delete_temp_channel failed: {e}")
-        await interaction.response.send_message(f"❌ Could not delete channel: {e}", ephemeral=True)
+        if isinstance(e, discord.Forbidden):
+            return await _tempvoice_send(interaction, "❌ I can't delete that channel (missing `Manage Channels`).")
+        return await _tempvoice_send(interaction, f"❌ Could not delete channel: {str(e)[:180]}")
+
+    tempvoice_runtime_owner_by_channel.pop(channel.id, None)
+    tempvoice_runtime_channel_by_owner.pop(interaction.user.id, None)
+    if tempvoice_coll:
+        try:
+            await tempvoice_coll.delete_one({"channel_id": channel.id})
+        except Exception as e:
+            print(f"⚠️ Temp voice DB delete failed (non-fatal): {e}")
+
+    return await _tempvoice_send(interaction, "🗑️ Temp channel deleted")
 
 @tree.command(name="rename", description="Rename your temp voice channel", guild=GUILD)
 @app_commands.describe(name="New name for channel")
 async def rename_temp_channel(interaction: discord.Interaction, name: str):
-    channel = await get_owned_temp_channel(interaction)
+    await _tempvoice_safe_defer(interaction)
+
+    channel = await check_temp_owner_and_channel(interaction)
     if not channel:
         return
+
+    name = (name or "").strip()
+    if not (1 <= len(name) <= 100):
+        return await _tempvoice_send(interaction, "❌ Channel name must be 1–100 characters.")
 
     try:
         await channel.edit(name=name)
-        await interaction.response.send_message("✏️ Channel renamed", ephemeral=True)
     except Exception as e:
         print(f"⚠️ rename_temp_channel failed: {e}")
-        await interaction.response.send_message(f"❌ Could not rename channel: {e}", ephemeral=True)
+        if isinstance(e, discord.Forbidden):
+            return await _tempvoice_send(interaction, "❌ I can't rename that channel (missing `Manage Channels`).")
+        return await _tempvoice_send(interaction, f"❌ Could not rename channel: {str(e)[:180]}")
+
+    return await _tempvoice_send(interaction, "✏️ Channel renamed")
 
 @tree.command(name="limit", description="Set user limit for your temp voice channel", guild=GUILD)
+@app_commands.describe(number="User limit (0 = unlimited, max 99)")
 async def limit_temp_channel(interaction: discord.Interaction, number: int):
-    channel = await get_owned_temp_channel(interaction)
+    await _tempvoice_safe_defer(interaction)
+
+    channel = await check_temp_owner_and_channel(interaction)
     if not channel:
         return
+
+    if number < 0 or number > 99:
+        return await _tempvoice_send(interaction, "❌ User limit must be between 0 and 99.")
 
     try:
         await channel.edit(user_limit=number)
-        await interaction.response.send_message(f"👥 User limit set to {number}", ephemeral=True)
     except Exception as e:
         print(f"⚠️ limit_temp_channel failed: {e}")
-        await interaction.response.send_message(f"❌ Could not set user limit: {e}", ephemeral=True)
+        if isinstance(e, discord.Forbidden):
+            return await _tempvoice_send(interaction, "❌ I can't set the user limit (missing `Manage Channels`).")
+        return await _tempvoice_send(interaction, f"❌ Could not set user limit: {str(e)[:180]}")
+
+    return await _tempvoice_send(interaction, f"👥 User limit set to {number}")
 
 @tree.command(name="lock", description="Lock your temp voice channel to everyone", guild=GUILD)
 async def lock_temp_channel(interaction: discord.Interaction):
-    channel = await get_owned_temp_channel(interaction)
+    await _tempvoice_safe_defer(interaction)
+
+    channel = await check_temp_owner_and_channel(interaction)
     if not channel:
         return
 
     try:
-        await channel.set_permissions(interaction.guild.default_role, connect=False)
-        await interaction.response.send_message("🔒 Channel locked", ephemeral=True)
+        await channel.set_permissions(interaction.guild.default_role, connect=False, view_channel=True)
     except Exception as e:
         print(f"⚠️ lock_temp_channel failed: {e}")
-        await interaction.response.send_message(f"❌ Could not lock channel: {e}", ephemeral=True)
+        if isinstance(e, discord.Forbidden):
+            return await _tempvoice_send(interaction, "❌ I can't lock that channel (missing `Manage Channels`).")
+        return await _tempvoice_send(interaction, f"❌ Could not lock channel: {str(e)[:180]}")
+
+    return await _tempvoice_send(interaction, "🔒 Channel locked")
 
 @tree.command(name="unlock", description="Unlock your temp voice channel", guild=GUILD)
 async def unlock_temp_channel(interaction: discord.Interaction):
-    channel = await get_owned_temp_channel(interaction)
+    await _tempvoice_safe_defer(interaction)
+
+    channel = await check_temp_owner_and_channel(interaction)
     if not channel:
         return
 
     try:
-        await channel.set_permissions(interaction.guild.default_role, connect=True)
-        await interaction.response.send_message("🔓 Channel unlocked", ephemeral=True)
+        await channel.set_permissions(interaction.guild.default_role, connect=True, view_channel=True)
     except Exception as e:
         print(f"⚠️ unlock_temp_channel failed: {e}")
-        await interaction.response.send_message(f"❌ Could not unlock channel: {e}", ephemeral=True)
+        if isinstance(e, discord.Forbidden):
+            return await _tempvoice_send(interaction, "❌ I can't unlock that channel (missing `Manage Channels`).")
+        return await _tempvoice_send(interaction, f"❌ Could not unlock channel: {str(e)[:180]}")
+
+    return await _tempvoice_send(interaction, "🔓 Channel unlocked")
 
 @tree.command(name="permit", description="Allow a member to join your temp voice channel", guild=GUILD)
+@app_commands.describe(member="Member to allow")
 async def permit_temp_channel(interaction: discord.Interaction, member: discord.Member):
-    channel = await get_owned_temp_channel(interaction)
+    await _tempvoice_safe_defer(interaction)
+
+    channel = await check_temp_owner_and_channel(interaction)
     if not channel:
         return
 
     try:
-        await channel.set_permissions(member, connect=True)
-        await interaction.response.send_message(f"✅ {member.mention} can join", ephemeral=True)
+        await channel.set_permissions(member, connect=True, view_channel=True)
     except Exception as e:
         print(f"⚠️ permit_temp_channel failed: {e}")
-        await interaction.response.send_message(f"❌ Could not permit member: {e}", ephemeral=True)
+        if isinstance(e, discord.Forbidden):
+            return await _tempvoice_send(interaction, "❌ I can't change permissions (missing `Manage Channels`).")
+        return await _tempvoice_send(interaction, f"❌ Could not permit member: {str(e)[:180]}")
+
+    return await _tempvoice_send(interaction, f"✅ {member.mention} can join")
 
 @tree.command(name="deny", description="Block a member from your temp voice channel", guild=GUILD)
+@app_commands.describe(member="Member to block")
 async def deny_temp_channel(interaction: discord.Interaction, member: discord.Member):
-    channel = await get_owned_temp_channel(interaction)
+    await _tempvoice_safe_defer(interaction)
+
+    channel = await check_temp_owner_and_channel(interaction)
     if not channel:
         return
 
     try:
-        await channel.set_permissions(member, connect=False)
-        await interaction.response.send_message(f"❌ {member.mention} denied", ephemeral=True)
+        await channel.set_permissions(member, connect=False, view_channel=False)
+        if member.voice and member.voice.channel and member.voice.channel.id == channel.id:
+            try:
+                await member.move_to(None, reason="Temp voice deny (disconnect)")
+            except Exception:
+                pass
     except Exception as e:
         print(f"⚠️ deny_temp_channel failed: {e}")
-        await interaction.response.send_message(f"❌ Could not deny member: {e}", ephemeral=True)
+        if isinstance(e, discord.Forbidden):
+            return await _tempvoice_send(interaction, "❌ I can't change permissions (missing `Manage Channels`).")
+        return await _tempvoice_send(interaction, f"❌ Could not deny member: {str(e)[:180]}")
+
+    return await _tempvoice_send(interaction, f"❌ {member.mention} denied")
 
 # ==================== LEADERBOARDS ====================
 
