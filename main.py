@@ -4020,9 +4020,20 @@ app.router.add_get('/', handle)
 app.router.add_get('/control', spa_fallback)
 app.router.add_get('/LEGEND-STAR', spa_fallback)
 
-# Serve SPA static files
-app.router.add_static('/LEGEND-STAR', 'legend-star', name='legend-star')
-app.router.add_static('/assets', 'legend-star/assets', name='assets')
+# Serve SPA static files (conditional - only if directories exist)
+if os.path.exists('legend-star'):
+    try:
+        app.router.add_static('/LEGEND-STAR', 'legend-star', name='legend-star')
+        print("✅ Static route /LEGEND-STAR mounted")
+    except Exception as e:
+        print(f"⚠️ Failed to mount /LEGEND-STAR: {e}")
+
+if os.path.exists('legend-star/assets'):
+    try:
+        app.router.add_static('/assets', 'legend-star/assets', name='assets')
+        print("✅ Static route /assets mounted")
+    except Exception as e:
+        print(f"⚠️ Failed to mount /assets: {e}")
 
 async def main():
     runner = web.AppRunner(app)
