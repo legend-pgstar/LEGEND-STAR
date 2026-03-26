@@ -35,6 +35,7 @@ from discord.app_commands import checks
 import socket
 import re
 import aiosqlite
+from motor.motor_asyncio import AsyncIOMotorClient
 
 load_dotenv()
 
@@ -43,9 +44,28 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 CLIENT_ID = os.getenv("CLIENT_ID")
 GUILD_ID_STR = os.getenv("GUILD_ID", "0")
 MONGODB_URI = os.getenv("MONGODB_URI")
+TEMP_VOICE_CATEGORY_ID = int(os.getenv("TEMP_VOICE_CATEGORY_ID", 0))  # Category for temp voice channels
 PORT = int(os.getenv("PORT", 3000))
 FRONTEND_URL = os.getenv("FRONTEND_URL", f"http://localhost:{PORT}/LEGEND-STAR")
 OWNER_ID = 1406313503278764174
+
+# Async Mongo (motor) for temp voice channel persistence
+if MONGODB_URI:
+    try:
+        mongo_async = AsyncIOMotorClient(
+            MONGODB_URI,
+            serverSelectionTimeoutMS=20000,
+            tlsAllowInvalidCertificates=True,
+            retryWrites=True
+        )
+        tempvoice_coll = mongo_async["legend_star"]["tempvoice"]
+    except Exception as e:
+        print(f"⚠️ Motor Mongo init failed: {e}")
+        mongo_async = None
+        tempvoice_coll = None
+else:
+    mongo_async = None
+    tempvoice_coll = None
 
 # Validate required environment variables
 if not TOKEN:
@@ -461,6 +481,28 @@ def is_whitelisted_entity(actor_or_id):
         return True
     
     return False
+
+# ==================== TEMP VOICE OWNER CONTROLS HELPERS ====================
+
+async def is_temp_channel_owner(user_id: int, channel_id: int) -> bool:
+    """Check whether user owns temp voice channel in DB"""
+    if not tempvoice_coll:
+        return False
+    try:
+        doc = await tempvoice_coll.find_one({"channel_id": channel_id})
+        return bool(doc and doc.get("owner_id") == user_id)
+    except Exception as e:
+        print(f"⚠️ is_temp_channel_owner DB error: {e}")
+        return False
+
+async def get_owner_channel_entry(channel_id: int):
+    if not tempvoice_coll:
+        return None
+    try:
+        return await tempvoice_coll.find_one({"channel_id": channel_id})
+    except Exception as e:
+        print(f"⚠️ get_owner_channel_entry DB error: {e}")
+        return None
 
 # Safe wrapper functions for MongoDB operations
 
@@ -956,7 +998,23 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
     # - Cam ON + Screenshare OFF = ✅ NO WARNING (camera is on, approved)
     # - Cam OFF + Screenshare ON = ⚠️ WARNING (need camera even with screenshare)
     # - Cam OFF + Screenshare OFF = ⚠️ WARNING (no camera, no screenshare)
-    
+
+    # Auto-delete temporary voice channels when empty
+    if before.channel and tempvoice_coll:
+        try:
+            temp_doc = await tempvoice_coll.find_one({"channel_id": before.channel.id})
+            if temp_doc and len(before.channel.members) == 0:
+                try:
+                    await before.channel.delete(reason="Auto-delete temp voice channel when empty")
+                except Exception as e:
+                    print(f"⚠️ Failed to auto-delete empty temp channel {before.channel.id}: {e}")
+                try:
+                    await tempvoice_coll.delete_one({"channel_id": before.channel.id})
+                except Exception as e:
+                    print(f"⚠️ Failed to remove temp channel DB entry {before.channel.id}: {e}")
+        except Exception as e:
+            print(f"⚠️ Temp channel cleanup check failed: {e}")
+
     # Cancel camera timer if user leaves voice channel
     if not after.channel and member.id in cam_timers:
         task = cam_timers.pop(member.id, None)
@@ -1273,6 +1331,158 @@ async def before_batch_save():
     """Ensure batch save starts running from the beginning"""
     await bot.wait_until_ready()
     print("✅ batch_save_study loop started")
+
+# ==================== TEMP VOICE OWNER CONTROLS ====================
+
+async def get_owned_temp_channel(interaction: discord.Interaction):
+    """Returns owned temp voice channel instance or None."""
+    if interaction.user.voice and interaction.user.voice.channel:
+        channel = interaction.user.voice.channel
+        if channel and await is_temp_channel_owner(interaction.user.id, channel.id):
+            return channel
+
+    if not tempvoice_coll:
+        return None
+
+    entry = await tempvoice_coll.find_one({"owner_id": interaction.user.id, "guild_id": interaction.guild.id})
+    if entry:
+        return interaction.guild.get_channel(entry.get("channel_id"))
+    return None
+
+async def check_temp_owner_and_channel(interaction: discord.Interaction):
+    channel = await get_owned_temp_channel(interaction)
+    if not channel:
+        await interaction.response.send_message("❌ You must be the owner of a temp voice channel and be in it to use this command.", ephemeral=True)
+        return None
+    return channel
+
+@tree.command(name="create", description="Create your own temporary voice channel", guild=GUILD)
+async def create_temp_channel(interaction: discord.Interaction):
+    guild = interaction.guild
+    if not guild:
+        return await interaction.response.send_message("❌ Guild context missing.", ephemeral=True)
+
+    existing = None
+    if tempvoice_coll:
+        existing = await tempvoice_coll.find_one({"owner_id": interaction.user.id, "guild_id": guild.id})
+
+    if existing:
+        existing_chan = guild.get_channel(existing.get("channel_id"))
+        if existing_chan:
+            return await interaction.response.send_message(f"⚠️ You already have a temp channel: {existing_chan.mention}", ephemeral=True)
+
+    category = guild.get_channel(TEMP_VOICE_CATEGORY_ID) if TEMP_VOICE_CATEGORY_ID else None
+    channel_name = f"{interaction.user.name}'s Room"
+
+    try:
+        channel = await guild.create_voice_channel(name=channel_name, category=category, reason="Temp voice channel create command")
+        if tempvoice_coll:
+            await tempvoice_coll.insert_one({"channel_id": channel.id, "owner_id": interaction.user.id, "guild_id": guild.id})
+
+        await channel.set_permissions(interaction.guild.default_role, connect=True)
+        await channel.set_permissions(interaction.user, manage_channels=True, connect=True, speak=True)
+
+        if interaction.user.voice and interaction.user.voice.channel:
+            await interaction.user.move_to(channel)
+
+        await interaction.response.send_message(f"✅ Created temp voice channel: {channel.mention}", ephemeral=True)
+    except Exception as e:
+        print(f"⚠️ create_temp_channel failed: {e}")
+        await interaction.response.send_message(f"❌ Failed to create temp channel: {e}", ephemeral=True)
+
+@tree.command(name="delete", description="Delete your temp voice channel", guild=GUILD)
+async def delete_temp_channel(interaction: discord.Interaction):
+    channel = await get_owned_temp_channel(interaction)
+    if not channel:
+        return
+
+    try:
+        await channel.delete(reason="Owner deleted temp voice channel")
+        if tempvoice_coll:
+            await tempvoice_coll.delete_one({"channel_id": channel.id})
+        await interaction.response.send_message("🗑️ Temp channel deleted", ephemeral=True)
+    except Exception as e:
+        print(f"⚠️ delete_temp_channel failed: {e}")
+        await interaction.response.send_message(f"❌ Could not delete channel: {e}", ephemeral=True)
+
+@tree.command(name="rename", description="Rename your temp voice channel", guild=GUILD)
+@app_commands.describe(name="New name for channel")
+async def rename_temp_channel(interaction: discord.Interaction, name: str):
+    channel = await get_owned_temp_channel(interaction)
+    if not channel:
+        return
+
+    try:
+        await channel.edit(name=name)
+        await interaction.response.send_message("✏️ Channel renamed", ephemeral=True)
+    except Exception as e:
+        print(f"⚠️ rename_temp_channel failed: {e}")
+        await interaction.response.send_message(f"❌ Could not rename channel: {e}", ephemeral=True)
+
+@tree.command(name="limit", description="Set user limit for your temp voice channel", guild=GUILD)
+async def limit_temp_channel(interaction: discord.Interaction, number: int):
+    channel = await get_owned_temp_channel(interaction)
+    if not channel:
+        return
+
+    try:
+        await channel.edit(user_limit=number)
+        await interaction.response.send_message(f"👥 User limit set to {number}", ephemeral=True)
+    except Exception as e:
+        print(f"⚠️ limit_temp_channel failed: {e}")
+        await interaction.response.send_message(f"❌ Could not set user limit: {e}", ephemeral=True)
+
+@tree.command(name="lock", description="Lock your temp voice channel to everyone", guild=GUILD)
+async def lock_temp_channel(interaction: discord.Interaction):
+    channel = await get_owned_temp_channel(interaction)
+    if not channel:
+        return
+
+    try:
+        await channel.set_permissions(interaction.guild.default_role, connect=False)
+        await interaction.response.send_message("🔒 Channel locked", ephemeral=True)
+    except Exception as e:
+        print(f"⚠️ lock_temp_channel failed: {e}")
+        await interaction.response.send_message(f"❌ Could not lock channel: {e}", ephemeral=True)
+
+@tree.command(name="unlock", description="Unlock your temp voice channel", guild=GUILD)
+async def unlock_temp_channel(interaction: discord.Interaction):
+    channel = await get_owned_temp_channel(interaction)
+    if not channel:
+        return
+
+    try:
+        await channel.set_permissions(interaction.guild.default_role, connect=True)
+        await interaction.response.send_message("🔓 Channel unlocked", ephemeral=True)
+    except Exception as e:
+        print(f"⚠️ unlock_temp_channel failed: {e}")
+        await interaction.response.send_message(f"❌ Could not unlock channel: {e}", ephemeral=True)
+
+@tree.command(name="permit", description="Allow a member to join your temp voice channel", guild=GUILD)
+async def permit_temp_channel(interaction: discord.Interaction, member: discord.Member):
+    channel = await get_owned_temp_channel(interaction)
+    if not channel:
+        return
+
+    try:
+        await channel.set_permissions(member, connect=True)
+        await interaction.response.send_message(f"✅ {member.mention} can join", ephemeral=True)
+    except Exception as e:
+        print(f"⚠️ permit_temp_channel failed: {e}")
+        await interaction.response.send_message(f"❌ Could not permit member: {e}", ephemeral=True)
+
+@tree.command(name="deny", description="Block a member from your temp voice channel", guild=GUILD)
+async def deny_temp_channel(interaction: discord.Interaction, member: discord.Member):
+    channel = await get_owned_temp_channel(interaction)
+    if not channel:
+        return
+
+    try:
+        await channel.set_permissions(member, connect=False)
+        await interaction.response.send_message(f"❌ {member.mention} denied", ephemeral=True)
+    except Exception as e:
+        print(f"⚠️ deny_temp_channel failed: {e}")
+        await interaction.response.send_message(f"❌ Could not deny member: {e}", ephemeral=True)
 
 # ==================== LEADERBOARDS ====================
 
