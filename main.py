@@ -45,6 +45,9 @@ CLIENT_ID = os.getenv("CLIENT_ID")
 GUILD_ID_STR = os.getenv("GUILD_ID", "0")
 MONGODB_URI = os.getenv("MONGODB_URI")
 TEMP_VOICE_CATEGORY_ID = int(os.getenv("TEMP_VOICE_CATEGORY_ID", 0))  # Category for temp voice channels
+TEMP_CATEGORY_ID = int(os.getenv("TEMP_CATEGORY_ID", 1486534382314455151))
+INTERFACE_CHANNEL_ID = int(os.getenv("INTERFACE_CHANNEL_ID", 1486552573652631732))
+LOBBY_CHANNEL_ID = int(os.getenv("LOBBY_CHANNEL_ID", 1486535158185197649))
 PORT = int(os.getenv("PORT", 3000))
 FRONTEND_URL = os.getenv("FRONTEND_URL", f"http://localhost:{PORT}/LEGEND-STAR")
 OWNER_ID = 1406313503278764174
@@ -66,6 +69,237 @@ if MONGODB_URI:
 else:
     mongo_async = None
     tempvoice_coll = None
+
+# Temp voice DB availability guard (avoid hangs if async Mongo is unreachable)
+tempvoice_db_available = tempvoice_coll is not None
+
+async def get_temp_channel_owner(channel):
+    """Return owner_id for temp channel (runtime cache first, then DB)."""
+    if not channel:
+        return None
+
+    runtime_owner = tempvoice_runtime_owner_by_channel.get(channel.id)
+    if runtime_owner is not None:
+        return runtime_owner
+
+    if tempvoice_db_available and tempvoice_coll is not None:
+        entry = await tempvoice_db_find_one({"channel_id": channel.id})
+        if entry and entry.get("owner_id"):
+            owner_id = entry.get("owner_id")
+            tempvoice_runtime_owner_by_channel[channel.id] = owner_id
+            tempvoice_runtime_channel_by_owner[owner_id] = channel.id
+            return owner_id
+
+    return None
+
+# ==================== TEMP VOICE CONTROL PANEL ====================
+class ControlPanel(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def interaction_check(self, interaction: discord.Interaction):
+        channel = interaction.user.voice.channel if interaction.user.voice else None
+        if not channel:
+            await interaction.response.send_message("❌ Join a voice channel first", ephemeral=True)
+            return False
+
+        owner_id = await get_temp_channel_owner(channel)
+        if owner_id is None:
+            await interaction.response.send_message("❌ This is not a temp channel or the owner is unknown", ephemeral=True)
+            return False
+
+        if owner_id != interaction.user.id:
+            await interaction.response.send_message("❌ You are not the owner of this channel", ephemeral=True)
+            return False
+
+        return True
+
+    @discord.ui.button(label="Lock", style=discord.ButtonStyle.danger, custom_id="tempvoice_lock_btn")
+    async def lock(self, interaction: discord.Interaction, button: discord.ui.Button):
+        channel = interaction.user.voice.channel
+        await channel.set_permissions(interaction.guild.default_role, connect=False)
+        await interaction.response.send_message("🔒 Channel locked", ephemeral=True)
+
+    @discord.ui.button(label="Unlock", style=discord.ButtonStyle.success, custom_id="tempvoice_unlock_btn")
+    async def unlock(self, interaction: discord.Interaction, button: discord.ui.Button):
+        channel = interaction.user.voice.channel
+        await channel.set_permissions(interaction.guild.default_role, connect=True)
+        await interaction.response.send_message("🔓 Channel unlocked", ephemeral=True)
+
+    @discord.ui.button(label="Hide", style=discord.ButtonStyle.secondary, custom_id="tempvoice_hide_btn")
+    async def hide(self, interaction: discord.Interaction, button):
+        channel = interaction.user.voice.channel
+        await channel.set_permissions(interaction.guild.default_role, view_channel=False)
+        await interaction.response.send_message("👁 Channel hidden", ephemeral=True)
+
+    @discord.ui.button(label="Unhide", style=discord.ButtonStyle.secondary, custom_id="tempvoice_unhide_btn")
+    async def unhide(self, interaction: discord.Interaction, button):
+        channel = interaction.user.voice.channel
+        await channel.set_permissions(interaction.guild.default_role, view_channel=True)
+        await interaction.response.send_message("👁‍🗨 Channel visible", ephemeral=True)
+
+    @discord.ui.button(label="Limit", style=discord.ButtonStyle.primary, custom_id="tempvoice_limit_btn")
+    async def limit(self, interaction: discord.Interaction, button):
+        # Use modal for input
+        modal = LimitModal()
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="Rename", style=discord.ButtonStyle.primary, custom_id="tempvoice_rename_btn")
+    async def rename(self, interaction: discord.Interaction, button):
+        modal = RenameModal()
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="Permit", style=discord.ButtonStyle.success, custom_id="tempvoice_permit_btn")
+    async def permit(self, interaction: discord.Interaction, button):
+        modal = PermitModal()
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="Deny", style=discord.ButtonStyle.danger, custom_id="tempvoice_deny_btn")
+    async def deny(self, interaction: discord.Interaction, button):
+        modal = DenyModal()
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="Claim", style=discord.ButtonStyle.secondary, custom_id="tempvoice_claim_btn")
+    async def claim(self, interaction: discord.Interaction, button):
+        global tempvoice_db_available
+        channel = interaction.user.voice.channel
+        if not channel:
+            return await interaction.response.send_message("❌ Join the voice channel first", ephemeral=True)
+
+        owner_id = await get_temp_channel_owner(channel)
+        if owner_id and owner_id in [m.id for m in channel.members]:
+            return await interaction.response.send_message("❌ Owner is still in the channel", ephemeral=True)
+
+        tempvoice_runtime_owner_by_channel[channel.id] = interaction.user.id
+        tempvoice_runtime_channel_by_owner[interaction.user.id] = channel.id
+
+        if tempvoice_db_available and tempvoice_coll is not None:
+            try:
+                await tempvoice_coll.update_one({"channel_id": channel.id}, {"$set": {"owner_id": interaction.user.id}}, upsert=True)
+            except Exception as e:
+                print(f"⚠️ Temp voice claim update failed: {e}")
+                tempvoice_db_available = False
+
+        await interaction.response.send_message("👑 Ownership claimed", ephemeral=True)
+
+    @discord.ui.button(label="Transfer", style=discord.ButtonStyle.secondary, custom_id="tempvoice_transfer_btn")
+    async def transfer(self, interaction: discord.Interaction, button):
+        modal = TransferModal()
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="Bitrate", style=discord.ButtonStyle.primary, custom_id="tempvoice_bitrate_btn")
+    async def bitrate(self, interaction: discord.Interaction, button):
+        modal = BitrateModal()
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="Region", style=discord.ButtonStyle.primary, custom_id="tempvoice_region_btn")
+    async def region(self, interaction: discord.Interaction, button):
+        modal = RegionModal()
+        await interaction.response.send_modal(modal)
+
+# Modals for inputs
+class LimitModal(discord.ui.Modal, title="Set User Limit"):
+    limit = discord.ui.TextInput(label="User Limit (0 for unlimited)", placeholder="0")
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            limit = int(self.limit.value)
+            channel = interaction.user.voice.channel
+            await channel.edit(user_limit=limit)
+            await interaction.response.send_message(f"👥 User limit set to {limit}", ephemeral=True)
+        except ValueError:
+            await interaction.response.send_message("❌ Invalid number", ephemeral=True)
+
+class RenameModal(discord.ui.Modal, title="Rename Channel"):
+    name = discord.ui.TextInput(label="New Channel Name", placeholder="My Room")
+
+    async def on_submit(self, interaction: discord.Interaction):
+        channel = interaction.user.voice.channel
+        await channel.edit(name=self.name.value)
+        await interaction.response.send_message(f"✏ Channel renamed to {self.name.value}", ephemeral=True)
+
+class PermitModal(discord.ui.Modal, title="Permit User"):
+    user = discord.ui.TextInput(label="User ID or Mention", placeholder="@user or 123456789")
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            user_id = int(self.user.value.strip('<@!>'))
+            user = interaction.guild.get_member(user_id)
+            if not user:
+                await interaction.response.send_message("❌ User not found", ephemeral=True)
+                return
+            channel = interaction.user.voice.channel
+            await channel.set_permissions(user, connect=True)
+            await interaction.response.send_message(f"✅ Permitted {user.mention}", ephemeral=True)
+        except ValueError:
+            await interaction.response.send_message("❌ Invalid user", ephemeral=True)
+
+class DenyModal(discord.ui.Modal, title="Deny User"):
+    user = discord.ui.TextInput(label="User ID or Mention", placeholder="@user or 123456789")
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            user_id = int(self.user.value.strip('<@!>'))
+            user = interaction.guild.get_member(user_id)
+            if not user:
+                await interaction.response.send_message("❌ User not found", ephemeral=True)
+                return
+            channel = interaction.user.voice.channel
+            await channel.set_permissions(user, connect=False)
+            await interaction.response.send_message(f"❌ Denied {user.mention}", ephemeral=True)
+        except ValueError:
+            await interaction.response.send_message("❌ Invalid user", ephemeral=True)
+
+class TransferModal(discord.ui.Modal, title="Transfer Ownership"):
+    user = discord.ui.TextInput(label="User ID or Mention", placeholder="@user or 123456789")
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            user_id = int(self.user.value.strip('<@!>'))
+            user = interaction.guild.get_member(user_id)
+            if not user:
+                await interaction.response.send_message("❌ User not found", ephemeral=True)
+                return
+            channel = interaction.user.voice.channel
+            if not channel:
+                return await interaction.response.send_message("❌ Join the voice channel first", ephemeral=True)
+
+            tempvoice_runtime_owner_by_channel[channel.id] = user_id
+            tempvoice_runtime_channel_by_owner[user_id] = channel.id
+
+            if tempvoice_db_available and tempvoice_coll is not None:
+                try:
+                    await tempvoice_coll.update_one({"channel_id": channel.id}, {"$set": {"owner_id": user_id}}, upsert=True)
+                except Exception as e:
+                    print(f"⚠️ Temp voice transfer update failed: {e}")
+                    tempvoice_db_available = False
+
+            await interaction.response.send_message(f"🔄 Ownership transferred to {user.mention}", ephemeral=True)
+        except ValueError:
+            await interaction.response.send_message("❌ Invalid user", ephemeral=True)
+
+class BitrateModal(discord.ui.Modal, title="Set Bitrate"):
+    bitrate = discord.ui.TextInput(label="Bitrate (8000-128000)", placeholder="64000")
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            bitrate = int(self.bitrate.value)
+            if not 8000 <= bitrate <= 128000:
+                await interaction.response.send_message("❌ Bitrate must be between 8000 and 128000", ephemeral=True)
+                return
+            channel = interaction.user.voice.channel
+            await channel.edit(bitrate=bitrate)
+            await interaction.response.send_message(f"🎧 Bitrate set to {bitrate}", ephemeral=True)
+        except ValueError:
+            await interaction.response.send_message("❌ Invalid number", ephemeral=True)
+
+class RegionModal(discord.ui.Modal, title="Set Region"):
+    region = discord.ui.TextInput(label="Region", placeholder="india")
+
+    async def on_submit(self, interaction: discord.Interaction):
+        channel = interaction.user.voice.channel
+        await channel.edit(rtc_region=self.region.value)
+        await interaction.response.send_message(f"🌍 Region set to {self.region.value}", ephemeral=True)
 
 # Validate required environment variables
 if not TOKEN:
@@ -487,16 +721,49 @@ def is_whitelisted_entity(actor_or_id):
 tempvoice_runtime_owner_by_channel = {}  # channel_id -> owner_id
 tempvoice_runtime_channel_by_owner = {}  # owner_id -> channel_id
 
+async def tempvoice_db_find_one(query):
+    global tempvoice_db_available
+    if not tempvoice_db_available or tempvoice_coll is None:
+        return None
+    try:
+        return await tempvoice_coll.find_one(query)
+    except Exception as e:
+        print(f"⚠️ Temp voice DB find_one error: {e}")
+        tempvoice_db_available = False
+        return None
+
+async def tempvoice_db_delete_many(query):
+    global tempvoice_db_available
+    if not tempvoice_db_available or tempvoice_coll is None:
+        return None
+    try:
+        return await tempvoice_coll.delete_many(query)
+    except Exception as e:
+        print(f"⚠️ Temp voice DB delete_many error: {e}")
+        tempvoice_db_available = False
+        return None
+
+async def tempvoice_db_insert_one(document):
+    global tempvoice_db_available
+    if not tempvoice_db_available or tempvoice_coll is None:
+        return None
+    try:
+        return await tempvoice_coll.insert_one(document)
+    except Exception as e:
+        print(f"⚠️ Temp voice DB insert_one error: {e}")
+        tempvoice_db_available = False
+        return None
+
 async def is_temp_channel_owner(user_id: int, channel_id: int) -> bool:
     """Check whether user owns temp voice channel in DB"""
     cached_owner = tempvoice_runtime_owner_by_channel.get(channel_id)
     if cached_owner is not None:
         return cached_owner == user_id
 
-    if not tempvoice_coll:
+    if not tempvoice_db_available or tempvoice_coll is None:
         return False
     try:
-        doc = await tempvoice_coll.find_one({"channel_id": channel_id})
+        doc = await tempvoice_db_find_one({"channel_id": channel_id})
         if doc and doc.get("owner_id") is not None:
             tempvoice_runtime_owner_by_channel[channel_id] = doc.get("owner_id")
             tempvoice_runtime_channel_by_owner[doc.get("owner_id")] = channel_id
@@ -506,10 +773,10 @@ async def is_temp_channel_owner(user_id: int, channel_id: int) -> bool:
         return False
 
 async def get_owner_channel_entry(channel_id: int):
-    if not tempvoice_coll:
+    if not tempvoice_db_available or tempvoice_coll is None:
         return None
     try:
-        return await tempvoice_coll.find_one({"channel_id": channel_id})
+        return await tempvoice_db_find_one({"channel_id": channel_id})
     except Exception as e:
         print(f"⚠️ get_owner_channel_entry DB error: {e}")
         return None
@@ -837,9 +1104,131 @@ async def action(
 # ==================== VOICE & CAM ====================
 @bot.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
-    if member.guild.id != GUILD_ID or member.bot:
+    global tempvoice_db_available
+
+    # Skip bots only (no guild restriction to allow multi-guild support)
+    if member.bot:
         return
-    
+
+    # 🔍 Debug: Log all voice state changes
+    if after.channel:
+        print(f"🔍 VC JOIN: {member.name} ({member.id}) → {after.channel.name} (ID: {after.channel.id}) | LOBBY_ID:{LOBBY_CHANNEL_ID}")
+    elif before.channel:
+        print(f"🔍 VC LEAVE: {member.name} ({member.id}) ← {before.channel.name} (ID: {before.channel.id})")
+
+    # CREATE temp voice channel when user joins lobby
+    if after.channel and after.channel.id == LOBBY_CHANNEL_ID:
+        print(f"✅ DETECTED: {member.name} joined LOBBY! Creating temp channel...")
+        try:
+            # Prevent duplicates for same owner
+            existing = None
+            print(f"  [CHECK] Scanning for existing channel owned by {member.name} (ID: {member.id})...")
+            if tempvoice_db_available and tempvoice_coll is not None:
+                existing = await tempvoice_db_find_one({"owner_id": member.id, "guild_id": member.guild.id})
+                if existing:
+                    print(f"  ✅ Found existing DB entry: {existing}")
+                else:
+                    print(f"  ℹ️ No existing channel found in DB")
+            else:
+                print(f"  ℹ️ MongoDB unavailable, checking runtime cache...")
+                existing = member.id in tempvoice_runtime_channel_by_owner
+                if existing:
+                    print(f"  ✅ Found existing channel in runtime cache")
+
+            if existing:
+                print(f"⚠️ Temp channel already exists for {member.name} (owner_id={member.id})")
+            else:
+                # 1️⃣ Fetch category
+                print(f"    [STEP 1] Fetching category {TEMP_CATEGORY_ID}...")
+                category = member.guild.get_channel(TEMP_CATEGORY_ID) if TEMP_CATEGORY_ID else None
+                if category and not isinstance(category, discord.CategoryChannel):
+                    print(f"    ⚠️ Channel {TEMP_CATEGORY_ID} is not a CategoryChannel")
+                    category = None
+                
+                if category:
+                    print(f"    ✅ Category found: {category.name}")
+                else:
+                    print(f"    ⚠️ Category not found! Creating channel without category.")
+
+                # 2️⃣ Create voice channel
+                channel_name = f"{member.name}'s Room"[:100]
+                print(f"    [STEP 2] Creating voice channel '{channel_name}'...")
+                channel = await member.guild.create_voice_channel(name=channel_name, category=category)
+                print(f"    ✅ Channel created: {channel.name} (ID: {channel.id})")
+
+                # 3️⃣ Save to MongoDB (if available)
+                print(f"    [STEP 3] Saving to database (db_available={tempvoice_db_available})...")
+                if tempvoice_db_available and tempvoice_coll is not None:
+                    try:
+                        await tempvoice_coll.insert_one({
+                            "channel_id": channel.id,
+                            "owner_id": member.id,
+                            "guild_id": member.guild.id,
+                            "created_at": datetime.datetime.utcnow()
+                        })
+                        print(f"    ✅ Saved to MongoDB")
+                    except Exception as e:
+                        print(f"    ⚠️ Temp voice DB insert failed: {e}")
+                        tempvoice_db_available = False
+                else:
+                    print(f"    ℹ️ Using runtime cache (MongoDB unavailable)")
+
+                # 4️⃣ Update caches
+                print(f"    [STEP 4] Updating runtime caches...")
+                tempvoice_runtime_owner_by_channel[channel.id] = member.id
+                tempvoice_runtime_channel_by_owner[member.id] = channel.id
+                print(f"    ✅ Caches updated")
+
+                # 5️⃣ Move user to channel
+                print(f"    [STEP 5] Moving {member.name} to channel (waiting 0.5s)...")
+                await asyncio.sleep(0.5)
+                await member.move_to(channel)
+                print(f"    ✅ User moved successfully")
+
+                print(f"✅✅✅ COMPLETE: {member.name} creation & move workflow finished")
+                print(f"   Channel: {channel.name} (ID: {channel.id})")
+        except Exception as e:
+            print(f"⚠️ Failed to create/move temp channel: {e}")
+
+    # DELETE temp voice channel when empty
+    if before.channel:
+        try:
+            print(f"🗑️  CHECKING: {before.channel.name} for deletion (members: {len(before.channel.members)})...")
+            data = None
+            if before.channel.id in tempvoice_runtime_owner_by_channel:
+                data = {"channel_id": before.channel.id, "owner_id": tempvoice_runtime_owner_by_channel[before.channel.id]}
+                print(f"  ✅ Found in runtime cache: owner={data['owner_id']}")
+            elif tempvoice_db_available and tempvoice_coll is not None:
+                data = await tempvoice_db_find_one({"channel_id": before.channel.id})
+                if data:
+                    print(f"  ✅ Found in MongoDB: owner={data.get('owner_id')}")
+
+            if data and len(before.channel.members) == 0:
+                print(f"  🗑️  Channel is empty! Deleting...")
+                await before.channel.delete()
+                print(f"  ✅ Channel deleted from Discord")
+
+                owner_id = tempvoice_runtime_owner_by_channel.pop(before.channel.id, None)
+                if owner_id:
+                    tempvoice_runtime_channel_by_owner.pop(owner_id, None)
+                    print(f"  ✅ Removed from runtime cache")
+
+                if tempvoice_db_available and tempvoice_coll is not None:
+                    try:
+                        await tempvoice_coll.delete_one({"channel_id": before.channel.id})
+                        print(f"  ✅ Removed from MongoDB")
+                    except Exception as e:
+                        print(f"  ⚠️ Temp voice DB delete_one failed: {e}")
+                        tempvoice_db_available = False
+
+                print(f"✅✅✅ COMPLETE: Deleted empty temp channel {before.channel.name}")
+            elif data:
+                print(f"  ℹ️ Channel not empty ({len(before.channel.members)} members remaining)")
+            else:
+                print(f"  ℹ️ Not a temp channel (no owner data found)")
+        except Exception as e:
+            print(f"⚠️ Failed to clean up temp channel: {e}")
+
     # =======================================
     # 🔊 VC SPAM SENSOR (Enhanced Hopping)
     # =======================================
@@ -1357,8 +1746,21 @@ async def _tempvoice_send(interaction: discord.Interaction, message: str):
         if interaction.response.is_done():
             await interaction.followup.send(message, ephemeral=True)
         else:
-            await interaction.response.send_message(message, ephemeral=True)
+            try:
+                await interaction.response.send_message(message, ephemeral=True)
+            except Exception as e_inner:
+                # If we already have a response, try followup.
+                if hasattr(e_inner, 'code') and getattr(e_inner, 'code', None) == 40060:
+                    await interaction.followup.send(message, ephemeral=True)
+                else:
+                    raise
     except Exception as e:
+        # Fallback for any crossthread race condition / double acknowledgement.
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True)
+        except Exception:
+            pass
         print(f"⚠️ tempvoice interaction send failed: {e}")
 
 
@@ -1387,11 +1789,11 @@ async def get_owned_temp_channel(interaction: discord.Interaction, *, require_us
             return runtime_channel
         tempvoice_runtime_channel_by_owner.pop(interaction.user.id, None)
 
-    if not tempvoice_coll:
+    if not tempvoice_db_available or tempvoice_coll is None:
         return None
 
     try:
-        entry = await tempvoice_coll.find_one({"owner_id": interaction.user.id, "guild_id": guild.id})
+        entry = await tempvoice_db_find_one({"owner_id": interaction.user.id, "guild_id": guild.id})
     except Exception as e:
         print(f"⚠️ get_owned_temp_channel DB error: {e}")
         return None
@@ -1437,11 +1839,8 @@ async def create_temp_channel(interaction: discord.Interaction):
         tempvoice_runtime_channel_by_owner.pop(interaction.user.id, None)
 
     existing = None
-    if tempvoice_coll:
-        try:
-            existing = await tempvoice_coll.find_one({"owner_id": interaction.user.id, "guild_id": guild.id})
-        except Exception as e:
-            print(f"⚠️ Temp voice DB check failed: {e}")
+    if tempvoice_db_available and tempvoice_coll is not None:
+        existing = await tempvoice_db_find_one({"owner_id": interaction.user.id, "guild_id": guild.id})
 
     if existing:
         existing_chan = guild.get_channel(existing.get("channel_id"))
@@ -1449,9 +1848,9 @@ async def create_temp_channel(interaction: discord.Interaction):
             tempvoice_runtime_owner_by_channel[existing_chan.id] = interaction.user.id
             tempvoice_runtime_channel_by_owner[interaction.user.id] = existing_chan.id
             return await _tempvoice_send(interaction, f"⚠️ You already have a temp channel: {existing_chan.mention}")
-        if tempvoice_coll:
+        if tempvoice_db_available and tempvoice_coll is not None:
             try:
-                await tempvoice_coll.delete_many({"owner_id": interaction.user.id, "guild_id": guild.id})
+                await tempvoice_db_delete_many({"owner_id": interaction.user.id, "guild_id": guild.id})
             except Exception as e:
                 print(f"⚠️ Temp voice stale entry cleanup failed: {e}")
 
@@ -1481,10 +1880,10 @@ async def create_temp_channel(interaction: discord.Interaction):
     tempvoice_runtime_owner_by_channel[channel.id] = interaction.user.id
     tempvoice_runtime_channel_by_owner[interaction.user.id] = channel.id
 
-    if tempvoice_coll:
+    if tempvoice_db_available and tempvoice_coll is not None:
         try:
-            await tempvoice_coll.delete_many({"owner_id": interaction.user.id, "guild_id": guild.id})
-            await tempvoice_coll.insert_one({"channel_id": channel.id, "owner_id": interaction.user.id, "guild_id": guild.id})
+            await tempvoice_db_delete_many({"owner_id": interaction.user.id, "guild_id": guild.id})
+            await tempvoice_db_insert_one({"channel_id": channel.id, "owner_id": interaction.user.id, "guild_id": guild.id})
         except Exception as e:
             print(f"⚠️ Temp voice DB save failed (non-fatal): {e}")
 
@@ -4131,6 +4530,13 @@ async def on_ready():
         except Exception as e:
             print(f"⚠️ MongoDB test failed: {e}")
     
+    # Register persistent temp voice controls view (to avoid interaction failure)
+    try:
+        bot.add_view(ControlPanel())
+        print("✅ Persistent ControlPanel view added")
+    except Exception as e:
+        print(f"⚠️ Error adding ControlPanel view: {e}")
+
     # Initialize SQLite spy database
     await init_spy_db()
     
@@ -4190,6 +4596,20 @@ async def on_ready():
                         continue
     except Exception as e:
         print(f"⚠️ Startup sweep error: {e}")
+
+    # Send temp voice control panel
+    try:
+        interface_channel = bot.get_channel(INTERFACE_CHANNEL_ID)
+        if interface_channel:
+            await interface_channel.send(
+                "🎛 **Voice Control Panel**\nUse buttons to manage your temp voice channel",
+                view=ControlPanel()
+            )
+            print("✅ Temp voice control panel sent")
+        else:
+            print(f"⚠️ Interface channel {INTERFACE_CHANNEL_ID} not found")
+    except Exception as e:
+        print(f"⚠️ Failed to send control panel: {e}")
 
 # Keep-alive and frontend hosting
 async def handle(_):
